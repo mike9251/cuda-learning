@@ -1,12 +1,10 @@
-﻿
-#include "cuda_runtime.h"
+﻿#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <memory>
 #include <stdio.h>
 #include <iostream>
 
 #include <chrono>
-
 
 #ifndef __CUDACC__  
     #define __CUDACC__
@@ -15,81 +13,36 @@
 #include <crt/device_functions.h>
 
 
-using Clock = std::chrono::steady_clock;
-using ms = std::chrono::duration<double, std::milli>;
-
-
 #define CHECK_CUDA_STATUS(status) { if (status != cudaSuccess) { \
     fprintf(stderr, "CUDA Error: %s (error code %d) at %s:%d\n", \
         cudaGetErrorString(status), status, __FILE__, __LINE__); exit(EXIT_FAILURE); } }
 
 
-void stencil1d_cpu(float* out, const float* in, const float* filter, unsigned int order, unsigned int length)
-{
-    for (unsigned int x = 0; x < length; x++)
-    {
-        float temp = 0.f;
+using Clock = std::chrono::steady_clock;
+using ms = std::chrono::duration<double, std::milli>;
 
-        // to preserve boundary conditions
-        if (x >= order && x < length - order)
-        {
-            for (unsigned int fx = 0; fx < 2 * order + 1; fx++)
-            {
-                temp += filter[fx] * in[x - order + fx];
-            }
-        }
-        else
-        {
-            temp = in[x];
-        }
 
-        out[x] = temp;
-    }
-}
+// Stencil coefficients (3d order = 2)
+static constexpr float a0 = 1.f;    // center
+static constexpr float a1 = 0.5f;   // right + 1
+static constexpr float a2 = 0.25f;  // right + 2
+static constexpr float a3 = 0.5f;   // left - 1
+static constexpr float a4 = 0.25f;  // left - 2
+static constexpr float a5 = 0.5f;   // top + 1
+static constexpr float a6 = 0.25f;  // top + 2
+static constexpr float a7 = 0.5f;   // bottom - 1
+static constexpr float a8 = 0.25f;  // bottom - 2
+static constexpr float a9 = 0.5f;   // front + 1
+static constexpr float a10 = 0.25f; // front + 2
+static constexpr float a11 = 0.5f;  // back + 1
+static constexpr float a12 = 0.25f; // back + 2
 
-void stencil2d_cpu(
-    float* out, 
-    const float* in, 
-    const float* filter_w, 
-    const float* filter_h, 
-    unsigned int order,
-    unsigned int width, 
-    unsigned int height)
-{
-    for (unsigned int row = 0; row < height; row++)
-    {
-        for (unsigned int col = 0; col < width; col++)
-        {
-            float temp = 0.f;
-
-            // to preserve boundary conditions
-            if (col >= order && col < width - order && row >= order && row < height - order)
-            {
-                for (unsigned int i = 0; i < 2 * order + 1; i++)
-                {
-                    temp += filter_w[i] * in[row * width + col - order + i] + \
-                        filter_h[i] * in[(row - order + i) * width + col];
-                }
-            }
-            else
-            {
-                temp = in[row * width + col];
-            }
-
-            out[row * width + col] = temp;
-        }
-    }
-}
 
 void stencil3d_cpu(
-    float* out, 
-    const float* in, 
-    const float* filter_w, 
-    const float* filter_h, 
-    const float* filter_z, 
-    unsigned int order, 
-    unsigned int width, 
-    unsigned int height, 
+    float* out,
+    const float* in,
+    unsigned int width,
+    unsigned int height,
     unsigned int depth)
 {
     for (unsigned int ch = 0; ch < depth; ch++)
@@ -98,184 +51,394 @@ void stencil3d_cpu(
         {
             for (unsigned int col = 0; col < width; col++)
             {
-                float temp = 0.f;
-
                 // to preserve boundary conditions
-                if (ch >= order && ch < depth - order && row >= order && row < height - order && col >= order && col < width - order)
+                if (ch >= 2 && ch < depth - 2 && row >= 2 && row < height - 2 && col >= 2 && col < width - 2)
                 {
-                    for (unsigned int i = 0; i < 2 * order + 1; i++)
-                    {
-
-                        temp += filter_w[i] * in[ch * height * width + row * width + col - order + i] + \
-                            filter_h[i] * in[ch * height * width + (row - order + i) * width + col] + \
-                            filter_z[i] * in[(ch - order + i) * height * width + row * width + col];
-                    }
+                    out[ch * height * width + row * width + col] = a0 * in[ch * height * width + row * width + col] + \
+                        a1 * in[ch * height * width + row * width + col + 1] + \
+                        a2 * in[ch * height * width + row * width + col + 2] + \
+                        a3 * in[ch * height * width + row * width + col - 1] + \
+                        a4 * in[ch * height * width + row * width + col - 2] + \
+                        a5 * in[ch * height * width + (row + 1) * width + col] + \
+                        a6 * in[ch * height * width + (row + 2) * width + col] + \
+                        a7 * in[ch * height * width + (row - 1) * width + col] + \
+                        a8 * in[ch * height * width + (row - 2) * width + col] + \
+                        a9 * in[(ch + 1) * height * width + row * width + col] + \
+                        a10 * in[(ch + 2) * height * width + row * width + col] + \
+                        a11 * in[(ch - 1) * height * width + row * width + col] + \
+                        a12 * in[(ch - 2) * height * width + row * width + col];
                 }
                 else
                 {
-                    temp = in[ch * height * width + row * width + col];
+                    out[ch * height * width + row * width + col] = in[ch * height * width + row * width + col];
                 }
-
-                out[ch * height * width + row * width + col] = temp;
             }
         }
+    }
+}
+
+
+
+__global__ void stencil3d_kernel(
+    float* out,
+    const float* in,
+    unsigned int width,
+    unsigned int height,
+    unsigned int channels)
+{
+    unsigned int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int ty = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned int tz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (tx >= width || ty >= height || tz >= channels)
+        return;
+
+    unsigned int depth_stride = height * width;
+
+    if (tx >= 2 && tx < width - 2 && ty >= 2 && ty < height - 2 && tz >= 2 && tz < channels - 2)
+    {
+        out[tz * depth_stride + ty * width + tx] = a0 * in[tz * depth_stride + ty * width + tx] + \
+            a1 * in[tz * depth_stride + ty * width + tx + 1] + \
+            a2 * in[tz * depth_stride + ty * width + tx + 2] + \
+            a3 * in[tz * depth_stride + ty * width + tx - 1] + \
+            a4 * in[tz * depth_stride + ty * width + tx - 2] + \
+            a5 * in[tz * depth_stride + (ty + 1) * width + tx] + \
+            a6 * in[tz * depth_stride + (ty + 2) * width + tx] + \
+            a7 * in[tz * depth_stride + (ty - 1) * width + tx] + \
+            a8 * in[tz * depth_stride + (ty - 2) * width + tx] + \
+            a9 * in[(tz + 1) * depth_stride + ty * width + tx] + \
+            a10 * in[(tz + 2) * depth_stride + ty * width + tx] + \
+            a11 * in[(tz - 1) * depth_stride + ty * width + tx] + \
+            a12 * in[(tz - 2) * depth_stride + ty * width + tx];
+    }
+    else
+    {
+        out[tz * depth_stride + ty * width + tx] = in[tz * depth_stride + ty * width + tx];
+    }
+}
+
+
+#define STENCIL_ORDER 2
+#define TILE_IN1 8
+#define TILE_OUT1 (TILE_IN1 - 2 * STENCIL_ORDER)
+
+__global__ void stencil3d_tiled_kernel(
+    float* out,
+    const float* in,
+    unsigned int width,
+    unsigned int height,
+    unsigned int channels)
+{
+	// 1. get thread position within the input tile
+    int in_col = blockIdx.x * TILE_OUT1 + threadIdx.x - STENCIL_ORDER;
+    int in_row = blockIdx.y * TILE_OUT1 + threadIdx.y - STENCIL_ORDER;
+    int in_ch = blockIdx.z * TILE_OUT1 + threadIdx.z - STENCIL_ORDER;
+
+    unsigned int depth_stride = height * width;
+    
+	// 2. load input tile to shared memory
+    __shared__ float smem[TILE_IN1][TILE_IN1][TILE_IN1];
+
+    if (in_ch >= 0 && in_ch < channels && in_row >= 0 && in_row < height && in_col >= 0 && in_col < width) // skip ghost elements
+    {
+        smem[threadIdx.z][threadIdx.y][threadIdx.x] = in[in_ch * depth_stride + in_row * width + in_col];
+    }
+
+    __syncthreads();
+
+    float temp = 0.f;
+
+	// 3. select threads that will compute output elements
+    if (threadIdx.x >= STENCIL_ORDER && threadIdx.x < TILE_OUT1 + STENCIL_ORDER && \
+        threadIdx.y >= STENCIL_ORDER && threadIdx.y < TILE_OUT1 + STENCIL_ORDER && \
+        threadIdx.z >= STENCIL_ORDER && threadIdx.z < TILE_OUT1 + STENCIL_ORDER)
+    {
+        unsigned int sx = threadIdx.x;
+        unsigned int sy = threadIdx.y;
+        unsigned int sz = threadIdx.z;
+
+        // 4. check that corresponding input elements are not ghost elements (map working threads back to global output grid)
+        if (in_col >= STENCIL_ORDER && in_col < width - STENCIL_ORDER &&
+            in_row >= STENCIL_ORDER && in_row < height - STENCIL_ORDER &&
+            in_ch >= STENCIL_ORDER && in_ch < channels - STENCIL_ORDER)
+        {
+            // 5. perform stencil computation using shared memory
+            temp = a0 * smem[sz][sy][sx] + \
+                a1 * smem[sz][sy][sx + 1] + \
+                a2 * smem[sz][sy][sx + 2] + \
+                a3 * smem[sz][sy][sx - 1] + \
+                a4 * smem[sz][sy][sx - 2] + \
+                a5 * smem[sz][sy + 1][sx] + \
+                a6 * smem[sz][sy + 2][sx] + \
+                a7 * smem[sz][sy - 1][sx] + \
+                a8 * smem[sz][sy - 2][sx] + \
+                a9 * smem[sz + 1][sy][sx] + \
+                a10 * smem[sz + 2][sy][sx] + \
+                a11 * smem[sz - 1][sy][sx] + \
+                a12 * smem[sz - 2][sy][sx];
+
+        }
+        else
+        {
+            temp = smem[sz][sy][sx];
+        }
+        if (in_ch < channels && in_row < height && in_col < width)
+         out[in_ch * depth_stride + in_row * width + in_col] = temp;
+    }
+
+}
+
+
+#define STENCIL_ORDER 2
+#define TILE_IN2 16
+#define TILE_OUT2 (TILE_IN2 - 2 * STENCIL_ORDER)
+
+__global__ void stencil3d_tiled_thread_coarsening_kernel(
+    float* out,
+    const float* in,
+    unsigned int width,
+    unsigned int height,
+    unsigned int channels)
+{
+    int gz = blockIdx.z * TILE_OUT2;
+	int gy = blockIdx.y * TILE_OUT2 + threadIdx.y - STENCIL_ORDER;
+    int gx = blockIdx.x * TILE_OUT2 + threadIdx.x - STENCIL_ORDER;
+
+    int channel_stride = height * width;
+
+    __shared__ float prev[TILE_IN2][TILE_IN2];
+    __shared__ float prev2[TILE_IN2][TILE_IN2];
+    __shared__ float curr[TILE_IN2][TILE_IN2];
+    __shared__ float next[TILE_IN2][TILE_IN2];
+    __shared__ float next2[TILE_IN2][TILE_IN2];
+
+    if (gz - 2 >= 0 && gz - 2 < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+    {
+        prev[threadIdx.y][threadIdx.x] = in[(gz - 2) * channel_stride + gy * width + gx];
+    }
+
+    if (gz - 1 >= 0 && gz - 1 < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+    {
+        prev2[threadIdx.y][threadIdx.x] = in[(gz - 1) * channel_stride + gy * width + gx];
+    }
+
+    if (gz >= 0 && gz < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+    {
+        curr[threadIdx.y][threadIdx.x] = in[gz * channel_stride + gy * width + gx];
+    }
+
+    if (gz + 1 < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+    {
+        next[threadIdx.y][threadIdx.x] = in[(gz + 1) * channel_stride + gy * width + gx];
+    }
+
+    float temp = 0.f;
+    for (int z = gz; z < gz + TILE_OUT2; z++)
+    {
+        if (z + 2 < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+        {
+            next2[threadIdx.y][threadIdx.x] = in[(z + 2) * channel_stride + gy * width + gx];
+        }
+
+        __syncthreads();
+
+        bool is_center = threadIdx.x >= STENCIL_ORDER && threadIdx.x < TILE_OUT2 + STENCIL_ORDER && \
+            threadIdx.y >= STENCIL_ORDER && threadIdx.y < TILE_OUT2 + STENCIL_ORDER;
+
+        bool is_interior = z >= STENCIL_ORDER && z < channels - STENCIL_ORDER && gy >= STENCIL_ORDER && gy < height - STENCIL_ORDER && \
+            gx >= STENCIL_ORDER && gx < width - STENCIL_ORDER;
+
+        if (is_center)
+        {
+            if (is_interior)
+            {
+                temp = a0 * curr[threadIdx.y][threadIdx.x] + \
+                    a1 * curr[threadIdx.y][threadIdx.x + 1] + \
+                    a2 * curr[threadIdx.y][threadIdx.x + 2] + \
+                    a3 * curr[threadIdx.y][threadIdx.x - 1] + \
+                    a4 * curr[threadIdx.y][threadIdx.x - 2] + \
+                    a5 * curr[threadIdx.y + 1][threadIdx.x] + \
+                    a6 * curr[threadIdx.y + 2][threadIdx.x] + \
+                    a7 * curr[threadIdx.y - 1][threadIdx.x] + \
+                    a8 * curr[threadIdx.y - 2][threadIdx.x] + \
+                    a9 * next[threadIdx.y][threadIdx.x] + \
+                    a10 * next2[threadIdx.y][threadIdx.x] + \
+                    a11 * prev2[threadIdx.y][threadIdx.x] + \
+                    a12 * prev[threadIdx.y][threadIdx.x];
+            }
+            else
+            {
+                temp = curr[threadIdx.y][threadIdx.x];
+            }
+
+            if (z < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+                out[z * channel_stride + gy * width + gx] = temp;
+        }
+        
+        __syncthreads();
+
+        prev[threadIdx.y][threadIdx.x] = prev2[threadIdx.y][threadIdx.x];
+        prev2[threadIdx.y][threadIdx.x] = curr[threadIdx.y][threadIdx.x];
+        curr[threadIdx.y][threadIdx.x] = next[threadIdx.y][threadIdx.x];
+        next[threadIdx.y][threadIdx.x] = next2[threadIdx.y][threadIdx.x];
+    }
+}
+
+
+__global__ void stencil3d_tiled_thread_coarsening_register_tiling_kernel(
+    float* out,
+    const float* in,
+    unsigned int width,
+    unsigned int height,
+    unsigned int channels)
+{
+    int gz = blockIdx.z * TILE_OUT2;
+    int gy = blockIdx.y * TILE_OUT2 + threadIdx.y - STENCIL_ORDER;
+    int gx = blockIdx.x * TILE_OUT2 + threadIdx.x - STENCIL_ORDER;
+
+    int channel_stride = height * width;
+
+    float prev = 0.f;
+    float prev2 = 0.f;
+    __shared__ float curr[TILE_IN2][TILE_IN2];
+    float next = 0.f;
+    float next2 = 0.f;
+
+    if (gz - 2 >= 0 && gz - 2 < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+    {
+        prev = in[(gz - 2) * channel_stride + gy * width + gx];
+    }
+
+    if (gz - 1 >= 0 && gz - 1 < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+    {
+        prev2 = in[(gz - 1) * channel_stride + gy * width + gx];
+    }
+
+    if (gz >= 0 && gz < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+    {
+        curr[threadIdx.y][threadIdx.x] = in[gz * channel_stride + gy * width + gx];
+    }
+
+    if (gz + 1 < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+    {
+        next = in[(gz + 1) * channel_stride + gy * width + gx];
+    }
+
+    float temp = 0.f;
+    for (int z = gz; z < gz + TILE_OUT2; z++)
+    {
+        if (z + 2 < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+        {
+            next2 = in[(z + 2) * channel_stride + gy * width + gx];
+        }
+
+        __syncthreads();
+
+        bool is_center = threadIdx.x >= STENCIL_ORDER && threadIdx.x < TILE_OUT2 + STENCIL_ORDER && \
+            threadIdx.y >= STENCIL_ORDER && threadIdx.y < TILE_OUT2 + STENCIL_ORDER;
+
+        bool is_interior = z >= STENCIL_ORDER && z < channels - STENCIL_ORDER && gy >= STENCIL_ORDER && gy < height - STENCIL_ORDER && \
+            gx >= STENCIL_ORDER && gx < width - STENCIL_ORDER;
+
+        if (is_center)
+        {
+            if (is_interior)
+            {
+                temp = a0 * curr[threadIdx.y][threadIdx.x] + \
+                    a1 * curr[threadIdx.y][threadIdx.x + 1] + \
+                    a2 * curr[threadIdx.y][threadIdx.x + 2] + \
+                    a3 * curr[threadIdx.y][threadIdx.x - 1] + \
+                    a4 * curr[threadIdx.y][threadIdx.x - 2] + \
+                    a5 * curr[threadIdx.y + 1][threadIdx.x] + \
+                    a6 * curr[threadIdx.y + 2][threadIdx.x] + \
+                    a7 * curr[threadIdx.y - 1][threadIdx.x] + \
+                    a8 * curr[threadIdx.y - 2][threadIdx.x] + \
+                    a9 * next + \
+                    a10 * next2 + \
+                    a11 * prev2 + \
+                    a12 * prev;
+            }
+            else
+            {
+                temp = curr[threadIdx.y][threadIdx.x];
+            }
+
+            if (z < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
+                out[z * channel_stride + gy * width + gx] = temp;
+        }
+
+        __syncthreads();
+
+        prev = prev2;
+        prev2 = curr[threadIdx.y][threadIdx.x];
+        curr[threadIdx.y][threadIdx.x] = next;
+        next = next2;
     }
 }
 
 
 void test_ref_code()
 {
+    std::cout << "--------------- Stencil 3D --------------\n";
+    unsigned int N = 10;
+
+    float* h_in = (float*)malloc(N * N * N * sizeof(float));
+
+    for (unsigned int z = 0; z < N; z++)
     {
-        std::cout << "--------------- Stencil 1D --------------\n";
-        unsigned int N = 10;
-        unsigned int order = 2;
-
-        std::unique_ptr<float[]> h_in(new float[N]);
-
-        for (unsigned int i = 0; i < N; i++)
+        for (unsigned int y = 0; y < N; y++)
         {
-            h_in[i] = (float)(i + 1);
+            for (unsigned int x = 0; x < N; x++)
+            {
+                h_in[z * N * N + y * N + x] = (float)(x + 1);
+            }
         }
+    }
 
-        float filter[5] = { 0.5f, 1.f, 1.f, 1.f, 0.5f };
+    float* h_out = (float*)malloc(N * N * N * sizeof(float));
 
-        std::unique_ptr<float[]> h_out(new float[N]);
+    stencil3d_cpu(h_out, h_in, N, N, N);
 
-        stencil1d_cpu(h_out.get(), h_in.get(), filter, 2, N);
-
-        std::cout << "Input: " << std::endl;
-        for (unsigned int i = 0; i < N; i++)
+    unsigned int z = 2;
+    std::cout << "Input: " << std::endl;
+    for (unsigned int y = 0; y < N; y++)
+    {
+        for (unsigned int x = 0; x < N; x++)
         {
-            std::cout << h_in[i] << " ";
-        }
-        std::cout << std::endl;
-        std::cout << "Output: " << std::endl;
-
-        for (unsigned int i = 0; i < N; i++)
-        {
-            std::cout << h_out[i] << " ";
+            std::cout << h_in[z * N * N + y * N + x] << " ";
         }
         std::cout << std::endl;
     }
 
+    std::cout << "Output: " << std::endl;
+
+    for (unsigned int y = 0; y < N; y++)
     {
-        std::cout << "--------------- Stencil 2D --------------\n";
-        unsigned int N = 10;
-        unsigned int order = 2;
-
-        float* h_in = (float*)malloc(N * N * sizeof(float));
-
-        for (unsigned int y = 0; y < N; y++)
+        for (unsigned int x = 0; x < N; x++)
         {
-            for (unsigned int x = 0; x < N; x++)
-            {
-                h_in[y * N + x] = (float)(x + 1);
-            }
+            std::cout << h_out[z * N * N + y * N + x] << " ";
         }
-
-        float filter_w[5] = { 0.5f, 1.f, 1.f, 1.f, 0.5f };
-        float filter_h[5] = { 0.5f, 1.f, 0.f, 1.f, 0.5f };
-
-        float* h_out = (float*)malloc(N * N * sizeof(float));
-
-        stencil2d_cpu(h_out, h_in, filter_w, filter_h, order, N, N);
-
-        std::cout << "Input: " << std::endl;
-        for (unsigned int y = 0; y < N; y++)
-        {
-            for (unsigned int x = 0; x < N; x++)
-            {
-                std::cout << h_in[y * N + x] << " ";
-            }
-            std::cout << std::endl;
-        }
-
-        std::cout << "Output: " << std::endl;
-
-        for (unsigned int y = 0; y < N; y++)
-        {
-            for (unsigned int x = 0; x < N; x++)
-            {
-                std::cout << h_out[y * N + x] << " ";
-            }
-            std::cout << std::endl;
-        }
-
-        free(h_in);
-        free(h_out);
+        std::cout << std::endl;
     }
 
-    {
-        std::cout << "--------------- Stencil 3D --------------\n";
-        unsigned int N = 10;
-        unsigned int order = 1;
-
-        float* h_in = (float*)malloc(N * N * N * sizeof(float));
-
-        for (unsigned int z = 0; z < N; z++)
-        {
-            for (unsigned int y = 0; y < N; y++)
-            {
-                for (unsigned int x = 0; x < N; x++)
-                {
-                    h_in[z * N * N + y * N + x] = (float)(x + 1);
-                }
-            }
-        }
-
-        float filter_w[3] = { 1.f, 1.f, 1.f };
-        float filter_h[3] = { 1.f, 0.f, 1.f };
-        float filter_z[3] = { 1.f, 0.f, 1.f };
-
-        float* h_out = (float*)malloc(N * N * N * sizeof(float));
-
-        stencil3d_cpu(h_out, h_in, filter_w, filter_h, filter_z, order, N, N, N);
-
-        unsigned int z = 2;
-        std::cout << "Input: " << std::endl;
-        for (unsigned int y = 0; y < N; y++)
-        {
-            for (unsigned int x = 0; x < N; x++)
-            {
-                std::cout << h_in[z * N * N + y * N + x] << " ";
-            }
-            std::cout << std::endl;
-        }
-
-        std::cout << "Output: " << std::endl;
-
-        for (unsigned int y = 0; y < N; y++)
-        {
-            for (unsigned int x = 0; x < N; x++)
-            {
-                std::cout << h_out[z * N * N + y * N + x] << " ";
-            }
-            std::cout << std::endl;
-        }
-
-        free(h_in);
-        free(h_out);
-    }
+    free(h_in);
+    free(h_out);
 }
 
 double benchmark_stencil3d_cpu(
-    float* out, 
-    const float* in, 
-    const float* filter_w, 
-    const float* filter_h,
-    const float* filter_z,
-    unsigned int order,
-    unsigned int width, 
-    unsigned int height, 
-    unsigned int channels, 
+    float* out,
+    const float* in,
+    unsigned int width,
+    unsigned int height,
+    unsigned int channels,
     unsigned int iters)
 {
     // warmup: make sure caches etc. are "hot"
-    stencil3d_cpu(out, in, filter_w, filter_h, filter_z, order, width, height, channels);
+    stencil3d_cpu(out, in, width, height, channels);
 
     auto start = Clock::now();
     for (int i = 0; i < iters; ++i) {
-        stencil3d_cpu(out, in, filter_w, filter_h, filter_z, order, width, height, channels);
+        stencil3d_cpu(out, in, width, height, channels);
     }
     auto end = Clock::now();
 
@@ -288,118 +451,6 @@ double benchmark_stencil3d_cpu(
     return avg_ms;
 }
 
-__global__ void stencil3d_kernel(
-    float* out,
-    const float* in,
-    const float* filter_w,
-    const float* filter_h,
-    const float* filter_z,
-    unsigned int order,
-    unsigned int width,
-    unsigned int height,
-    unsigned int channels)
-{
-    unsigned int tx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int ty = blockIdx.y * blockDim.y + threadIdx.y;
-    unsigned int tz = blockIdx.z * blockDim.z + threadIdx.z;
-
-    unsigned int depth_stride = height * width;
-
-    float temp = 0.f;
-    if (tx >= order && tx < width - order && ty >= order && ty < height - order && tz >= order && tz < channels - order)
-    {
-        for (unsigned int i = 0; i < 2 * order + 1; i++)
-        {
-            temp += filter_w[i] * in[tz * depth_stride + ty * width + tx - order + i] + \
-                filter_h[i] * in[tz * depth_stride + (ty - order + i) * width + tx] + \
-                filter_z[i] * in[(tz - order + i) * depth_stride + ty * width + tx];
-        }
-    }
-    else
-    {
-        temp = in[tz * depth_stride + ty * width + tx];
-    }
-
-    if (tz < channels && ty < height && tx < width)
-        out[tz * depth_stride + ty * width + tx] = temp;
-}
-
-
-#define STENCIL_ORDER 5
-#define TILE 8
-#define SH 2 * STENCIL_ORDER + TILE
-
-__global__ void stencil3d_tiled_kernel(
-    float* out,
-    const float* in,
-    const float* filter_w,
-    const float* filter_h,
-    const float* filter_z,
-    int order,
-    unsigned int width,
-    unsigned int height,
-    unsigned int channels)
-{
-    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
-    unsigned int ch = blockIdx.z * blockDim.z + threadIdx.z;
-
-    unsigned int bx = blockIdx.x * blockDim.x;
-    unsigned int by = blockIdx.y * blockDim.y;
-    unsigned int bz = blockIdx.z * blockDim.z;
-
-    unsigned int tx = threadIdx.x;
-    unsigned int ty = threadIdx.y;
-    unsigned int tz = threadIdx.z;
-
-    unsigned int depth_stride = height * width;
-
-    __shared__ float smem[SH][SH][SH];
-
-    for (unsigned int sz = tz; sz < SH; sz += TILE)
-    {
-        for (unsigned int sy = ty; sy < SH; sy += TILE)
-        {
-            for (unsigned int sx = tx; sx < SH; sx += TILE)
-            {
-                unsigned int gz = bz + sz - order;
-                unsigned int gy = by + sy - order;
-                unsigned int gx = bx + sx - order;
-
-                if (gz >= 0 && gz < channels && gy >= 0 && gy < height && gx >= 0 && gx < width)
-                {
-                    smem[sz][sy][sx] = in[gz * depth_stride + gy * width + gx];
-                }
-            }
-        }
-    }
-
-    __syncthreads();
-
-    float temp = 0.f;
-    if (col >= order && col < width - order && row >= order && row < height - order && ch >= order && ch < channels - order)
-    {
-
-        unsigned int sx = tx + order;
-        unsigned int sy = ty + order;
-        unsigned int sz = tz + order;
-
-        for (int i = -order; i <= order; i++)
-        {
-            unsigned int k = i + order;
-            temp += filter_w[k] * smem[sz][sy][sx + i] + \
-                filter_h[k] * smem[sz][sy + i][sx] + \
-                filter_z[k] * smem[sz + i][sy][sx];
-        }
-    }
-    else
-    {
-        temp = in[ch * depth_stride + row * width + col];
-    }
-
-    if (ch < channels && row < height && col < width)
-        out[ch * depth_stride + row * width + col] = temp;
-}
 
 
 unsigned int cdiv(unsigned int n, unsigned int x)
@@ -407,17 +458,14 @@ unsigned int cdiv(unsigned int n, unsigned int x)
     return (n + x - 1) / x;
 }
 
+
 void benchmark_stencil3d_kernel(
-    float* d_out, 
-    const float* d_in, 
-    const float* d_filter_w,
-    const float* d_filter_h,
-    const float* d_filter_z,
-    unsigned int order, 
+    float* d_out,
+    const float* d_in,
     unsigned int width,
     unsigned int height,
     unsigned int channels,
-    int blockSize, 
+    int blockSize,
     int iters)
 {
     dim3 block_size(blockSize, blockSize, blockSize);
@@ -425,7 +473,7 @@ void benchmark_stencil3d_kernel(
 
     // Warm-up (not timed)
     for (int i = 0; i < 5; ++i) {
-        stencil3d_kernel << <grid_size, block_size >> > (d_out, d_in, d_filter_w, d_filter_h, d_filter_z, order, width, height, channels);
+        stencil3d_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
     }
     CHECK_CUDA_STATUS(cudaDeviceSynchronize());
 
@@ -437,7 +485,7 @@ void benchmark_stencil3d_kernel(
     // Record start
     CHECK_CUDA_STATUS(cudaEventRecord(start));
     for (int i = 0; i < iters; ++i) {
-        stencil3d_kernel << <grid_size, block_size >> > (d_out, d_in, d_filter_w, d_filter_h, d_filter_z, order, width, height, channels);
+        stencil3d_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
     }
     CHECK_CUDA_STATUS(cudaEventRecord(stop));
     CHECK_CUDA_STATUS(cudaEventSynchronize(stop));
@@ -455,13 +503,13 @@ void benchmark_stencil3d_kernel(
 
     unsigned int N = height * width * channels;
     // Bytes moved per kernel call
-    double bytes = 0.05 * N * (2.0 * 3.0 * (2.0 * order + 1) + 1) * sizeof(float);
+    double bytes = N * 14 * sizeof(float);
     double gbytes = bytes / 1e9;
 
-    double bw_GBps = gbytes / avg_s;                // achieved bandwidth
-    double flops = N * 5.0 * (2.0 * order + 1);     // (2 * order + 1)*5 FLOP per element
-    double gflops = (flops / avg_s) / 1e9;          // FLOP/s → GFLOP/s
-    double intensity = flops / bytes;               // FLOP/byte
+    double bw_GBps = gbytes / avg_s;
+    double flops = N * 25;
+    double gflops = (flops / avg_s) / 1e9;
+    double intensity = flops / bytes;
 
     std::cout << "Stencil 3D kernel benchmark\n";
     std::cout << "  N              = " << N << "\n";
@@ -476,22 +524,17 @@ void benchmark_stencil3d_kernel(
 void benchmark_stencil3d_tiled_kernel(
     float* d_out,
     const float* d_in,
-    const float* d_filter_w,
-    const float* d_filter_h,
-    const float* d_filter_z,
-    unsigned int order,
     unsigned int width,
     unsigned int height,
     unsigned int channels,
-    int blockSize,
     int iters)
 {
-    dim3 block_size(blockSize, blockSize, blockSize);
-    dim3 grid_size(cdiv(width, block_size.x), cdiv(height, block_size.y), cdiv(channels, block_size.z));
+    dim3 block_size(TILE_IN1, TILE_IN1, TILE_IN1);
+    dim3 grid_size(cdiv(width, TILE_OUT1), cdiv(height, TILE_OUT1), cdiv(channels, TILE_OUT1));
 
     // Warm-up (not timed)
     for (int i = 0; i < 5; ++i) {
-        stencil3d_tiled_kernel << <grid_size, block_size >> > (d_out, d_in, d_filter_w, d_filter_h, d_filter_z, order, width, height, channels);
+        stencil3d_tiled_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
     }
     CHECK_CUDA_STATUS(cudaDeviceSynchronize());
 
@@ -503,7 +546,7 @@ void benchmark_stencil3d_tiled_kernel(
     // Record start
     CHECK_CUDA_STATUS(cudaEventRecord(start));
     for (int i = 0; i < iters; ++i) {
-        stencil3d_tiled_kernel << <grid_size, block_size >> > (d_out, d_in, d_filter_w, d_filter_h, d_filter_z, order, width, height, channels);
+        stencil3d_tiled_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
     }
     CHECK_CUDA_STATUS(cudaEventRecord(stop));
     CHECK_CUDA_STATUS(cudaEventSynchronize(stop));
@@ -521,21 +564,147 @@ void benchmark_stencil3d_tiled_kernel(
 
     unsigned int N = height * width * channels;
     // Bytes moved per kernel call
-    double bytes = 0.05 * N * (2.0 * 3.0 * (2.0 * order + 1) + 1) * sizeof(float);
+    double bytes = grid_size.x * grid_size.y * grid_size.z * (TILE_IN1 * TILE_IN1 * TILE_IN1 + TILE_OUT1 * TILE_OUT1 * TILE_OUT1) * sizeof(float);
     double gbytes = bytes / 1e9;
 
-    double bw_GBps = gbytes / avg_s;                // achieved bandwidth
-    double flops = N * 5.0 * (2.0 * order + 1);     // (2 * order + 1)*5 FLOP per element
-    double gflops = (flops / avg_s) / 1e9;          // FLOP/s → GFLOP/s
-    double intensity = flops / bytes;               // FLOP/byte
+    double bw_GBps = gbytes / avg_s;
+    double flops = grid_size.x * grid_size.y * grid_size.z * TILE_OUT1 * TILE_OUT1 * TILE_OUT1 * 25;
+    double flops_per_tile = TILE_OUT1 * TILE_OUT1 * TILE_OUT1 * 25;
+    double gflops = (flops / avg_s) / 1e9;
+    double intensity = flops / bytes;
 
     std::cout << "Stencil 3D tiled kernel benchmark\n";
     std::cout << "  N              = " << N << "\n";
-    std::cout << "  blockSize      = " << blockSize << "\n";
     std::cout << "  iters          = " << iters << "\n";
     std::cout << "  avg time       = " << avg_ms << " ms\n";
     std::cout << "  bandwidth      = " << bw_GBps << " GB/s\n";
     std::cout << "  GFLOP/s        = " << gflops << "\n";
+    std::cout << "  FLOPPerTile/s  = " << flops_per_tile << "\n";
+    std::cout << "  arithmetic I   = " << intensity << " FLOP/B\n";
+}
+
+
+void benchmark_stencil3d_tiled_thread_coarsening_kernel(
+    float* d_out,
+    const float* d_in,
+    unsigned int width,
+    unsigned int height,
+    unsigned int channels,
+    int iters)
+{
+    dim3 block_size(TILE_IN2, TILE_IN2, 1);
+    dim3 grid_size(cdiv(width, TILE_OUT2), cdiv(height, TILE_OUT2), cdiv(channels, TILE_OUT2));
+
+    // Warm-up (not timed)
+    for (int i = 0; i < 5; ++i) {
+        stencil3d_tiled_thread_coarsening_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
+    }
+    CHECK_CUDA_STATUS(cudaDeviceSynchronize());
+
+    // Create events
+    cudaEvent_t start, stop;
+    CHECK_CUDA_STATUS(cudaEventCreate(&start));
+    CHECK_CUDA_STATUS(cudaEventCreate(&stop));
+
+    // Record start
+    CHECK_CUDA_STATUS(cudaEventRecord(start));
+    for (int i = 0; i < iters; ++i) {
+        stencil3d_tiled_thread_coarsening_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
+    }
+    CHECK_CUDA_STATUS(cudaEventRecord(stop));
+    CHECK_CUDA_STATUS(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CHECK_CUDA_STATUS(cudaEventElapsedTime(&ms, start, stop));
+
+    // Cleanup events
+    CHECK_CUDA_STATUS(cudaEventDestroy(start));
+    CHECK_CUDA_STATUS(cudaEventDestroy(stop));
+
+    // Average kernel time
+    double avg_ms = ms / iters;
+    double avg_s = avg_ms * 1e-3;
+
+    unsigned int N = height * width * channels;
+    // Bytes moved per kernel call
+    double bytes = grid_size.x * grid_size.y * grid_size.z * (TILE_IN2 * TILE_IN2 * TILE_IN2 + TILE_OUT2 * TILE_OUT2 * TILE_OUT2) * sizeof(float);
+    double gbytes = bytes / 1e9;
+
+    double bw_GBps = gbytes / avg_s;
+    double flops = grid_size.x * grid_size.y * grid_size.z * TILE_OUT2 * TILE_OUT2 * TILE_OUT2 * 25;
+    double flops_per_tile = TILE_OUT2 * TILE_OUT2 * TILE_OUT2 * 25;
+    double gflops = (flops / avg_s) / 1e9;
+    double intensity = flops / bytes;
+
+    std::cout << "Stencil 3D tiled thread coarsening kernel benchmark\n";
+    std::cout << "  N              = " << N << "\n";
+    std::cout << "  iters          = " << iters << "\n";
+    std::cout << "  avg time       = " << avg_ms << " ms\n";
+    std::cout << "  bandwidth      = " << bw_GBps << " GB/s\n";
+    std::cout << "  GFLOP/s        = " << gflops << "\n";
+    std::cout << "  FLOPPerTile/s  = " << flops_per_tile << "\n";
+    std::cout << "  arithmetic I   = " << intensity << " FLOP/B\n";
+}
+
+void benchmark_stencil3d_tiled_thread_coarsening_register_tiling_kernel(
+    float* d_out,
+    const float* d_in,
+    unsigned int width,
+    unsigned int height,
+    unsigned int channels,
+    int iters)
+{
+    dim3 block_size(TILE_IN2, TILE_IN2, 1);
+    dim3 grid_size(cdiv(width, TILE_OUT2), cdiv(height, TILE_OUT2), cdiv(channels, TILE_OUT2));
+
+    // Warm-up (not timed)
+    for (int i = 0; i < 5; ++i) {
+        stencil3d_tiled_thread_coarsening_register_tiling_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
+    }
+    CHECK_CUDA_STATUS(cudaDeviceSynchronize());
+
+    // Create events
+    cudaEvent_t start, stop;
+    CHECK_CUDA_STATUS(cudaEventCreate(&start));
+    CHECK_CUDA_STATUS(cudaEventCreate(&stop));
+
+    // Record start
+    CHECK_CUDA_STATUS(cudaEventRecord(start));
+    for (int i = 0; i < iters; ++i) {
+        stencil3d_tiled_thread_coarsening_register_tiling_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
+    }
+    CHECK_CUDA_STATUS(cudaEventRecord(stop));
+    CHECK_CUDA_STATUS(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CHECK_CUDA_STATUS(cudaEventElapsedTime(&ms, start, stop));
+
+    // Cleanup events
+    CHECK_CUDA_STATUS(cudaEventDestroy(start));
+    CHECK_CUDA_STATUS(cudaEventDestroy(stop));
+
+    // Average kernel time
+    double avg_ms = ms / iters;
+    double avg_s = avg_ms * 1e-3;
+
+    unsigned int N = height * width * channels;
+    // Bytes moved per kernel call
+    double bytes = grid_size.x * grid_size.y * grid_size.z * (TILE_IN2 * TILE_IN2 * TILE_IN2 + TILE_OUT2 * TILE_OUT2 * TILE_OUT2) * sizeof(float);
+    double gbytes = bytes / 1e9;
+
+    double bw_GBps = gbytes / avg_s;
+    double flops = grid_size.x * grid_size.y * grid_size.z * TILE_OUT2 * TILE_OUT2 * TILE_OUT2 * 25;
+    double flops_per_tile = TILE_OUT2 * TILE_OUT2 * TILE_OUT2 * 25;
+    double gflops = (flops / avg_s) / 1e9;
+    double intensity = flops / bytes;
+
+    std::cout << "Stencil 3D tiled thread coarsening register tiling kernel benchmark\n";
+    std::cout << "  N              = " << N << "\n";
+    std::cout << "  iters          = " << iters << "\n";
+    std::cout << "  avg time       = " << avg_ms << " ms\n";
+    std::cout << "  bandwidth      = " << bw_GBps << " GB/s\n";
+    std::cout << "  GFLOP/s        = " << gflops << "\n";
+    std::cout << "  FLOPPerTile/s  = " << flops_per_tile << "\n";
     std::cout << "  arithmetic I   = " << intensity << " FLOP/B\n";
 }
 
@@ -546,7 +715,7 @@ int main()
     unsigned int width = 1000;
     unsigned int height = 100;
     unsigned int channels = 100;
-    unsigned int order = 5;
+    unsigned int order = 2;
 
     unsigned int N = width * height * channels;
 
@@ -563,46 +732,29 @@ int main()
         }
     }
 
-    //float filter_w[5] = { 0.5f, 1.f, 1.f, 1.f, 0.5f };
-    //float filter_h[5] = { 0.5f, 1.f, 0.f, 1.f, 0.5f };
-    //float filter_z[5] = { 0.5f, 1.f, 0.f, 1.f, 0.5f };
-
-    float filter_w[11] = { 0.5f, 1.f, 1.f, 1.f, 0.5f, 1.f, 0.5f, 1.f, 1.f, 1.f, 0.5f };
-    float filter_h[11] = { 0.5f, 1.f, 0.f, 1.f, 0.5f, 0.f, 0.5f, 1.f, 1.f, 1.f, 0.5f };
-    float filter_z[11] = { 0.5f, 1.f, 0.f, 1.f, 0.5f, 0.f, 0.5f, 1.f, 1.f, 1.f, 0.5f };
-
     std::unique_ptr<float[]> h_out(new float[N]);
     std::unique_ptr<float[]> out_ref(new float[N]);
 
-    stencil3d_cpu(out_ref.get(), h_in.get(), filter_w, filter_h, filter_z, order, width, height, channels);
+    stencil3d_cpu(out_ref.get(), h_in.get(), width, height, channels);
 
-    //double t = benchmark_stencil3d_cpu(h_out.get(), h_in.get(), filter_w, filter_h, filter_z, order, width, height, channels, 100);
+    //double t = benchmark_stencil3d_cpu(h_out.get(), h_in.get(), width, height, channels, 100);
     //std::cout << "CPU kernel took: " << t << "ms\n";
 
     float* d_in = nullptr;
     float* d_out = nullptr;
-    float* d_filter_w = nullptr;
-    float* d_filter_h = nullptr;
-    float* d_filter_z = nullptr;
 
     size_t size = N * sizeof(float);
     size_t filter_size = (2.0 * order + 1) * sizeof(float);
 
     CHECK_CUDA_STATUS(cudaMalloc(&d_in, size));
     CHECK_CUDA_STATUS(cudaMalloc(&d_out, size));
-    CHECK_CUDA_STATUS(cudaMalloc(&d_filter_w, filter_size));
-    CHECK_CUDA_STATUS(cudaMalloc(&d_filter_h, filter_size));
-    CHECK_CUDA_STATUS(cudaMalloc(&d_filter_z, filter_size));
-    
+
     cudaEvent_t start, stop;
     CHECK_CUDA_STATUS(cudaEventCreate(&start));
     CHECK_CUDA_STATUS(cudaEventCreate(&stop));
 
     CHECK_CUDA_STATUS(cudaEventRecord(start));
     CHECK_CUDA_STATUS(cudaMemcpy(d_in, h_in.get(), size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_STATUS(cudaMemcpy(d_filter_w, filter_w, filter_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_STATUS(cudaMemcpy(d_filter_h, filter_h, filter_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_STATUS(cudaMemcpy(d_filter_z, filter_z, filter_size, cudaMemcpyHostToDevice));
 
     CHECK_CUDA_STATUS(cudaEventRecord(stop));
     CHECK_CUDA_STATUS(cudaEventSynchronize(stop));
@@ -610,9 +762,21 @@ int main()
     float h2d_ms = 0.0f;
     CHECK_CUDA_STATUS(cudaEventElapsedTime(&h2d_ms, start, stop));
 
-    dim3 block_size(8, 8, 8);
-    dim3 grid_size(cdiv(width, block_size.x), cdiv(height, block_size.y), cdiv(channels, block_size.z));
-    stencil3d_tiled_kernel <<<grid_size, block_size >>>(d_out, d_in, d_filter_w, d_filter_h, d_filter_z, order, width, height, channels);
+    /*dim3 block_size(8, 8, 8);
+    dim3 grid_size(cdiv(width, 8), cdiv(height, 8), cdiv(channels, 8));
+    stencil3d_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);*/
+
+    /*dim3 block_size(TILE_IN1, TILE_IN1, TILE_IN1);
+    dim3 grid_size(cdiv(width, TILE_OUT1), cdiv(height, TILE_OUT1), cdiv(channels, TILE_OUT1));
+    stencil3d_tiled_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);*/
+
+    /*dim3 block_size(TILE_IN2, TILE_IN2, 1);
+    dim3 grid_size(cdiv(width, TILE_OUT2), cdiv(height, TILE_OUT2), cdiv(channels, TILE_OUT2));
+    stencil3d_tiled_thread_coarsening_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);*/
+
+    dim3 block_size(TILE_IN2, TILE_IN2, 1);
+    dim3 grid_size(cdiv(width, TILE_OUT2), cdiv(height, TILE_OUT2), cdiv(channels, TILE_OUT2));
+    stencil3d_tiled_thread_coarsening_register_tiling_kernel << <grid_size, block_size >> > (d_out, d_in, width, height, channels);
 
     CHECK_CUDA_STATUS(cudaEventRecord(start));
     CHECK_CUDA_STATUS(cudaMemcpy(h_out.get(), d_out, size, cudaMemcpyDeviceToHost));
@@ -647,20 +811,19 @@ int main()
         max_rel_diff = std::max(max_rel_diff, reld);
 
         // Optional debug: print first mismatch
-         if (absd > 1e-3f) { std::cout << "mismatch at " << i << ": ref=" << ref << " got=" << got << "\n"; break; }
+        if (absd > 1e-3f) { std::cout << "mismatch at " << i << ": ref=" << ref << " got=" << got << "\n"; break; }
     }
 
     std::cout << "Max abs diff = " << max_abs_diff << "\n";
     std::cout << "Max rel diff = " << max_rel_diff << "\n";
 
-    benchmark_stencil3d_kernel(d_out, d_in, d_filter_w, d_filter_h, d_filter_z, order, width, height, channels, 8, 100);
-    benchmark_stencil3d_tiled_kernel(d_out, d_in, d_filter_w, d_filter_h, d_filter_z, order, width, height, channels, 8, 100);
+    //benchmark_stencil3d_kernel(d_out, d_in, width, height, channels, 8, 100);
+    //benchmark_stencil3d_tiled_kernel(d_out, d_in, width, height, channels, 100);
+    //benchmark_stencil3d_tiled_thread_coarsening_kernel(d_out, d_in, width, height, channels, 100);
+    benchmark_stencil3d_tiled_thread_coarsening_register_tiling_kernel(d_out, d_in, width, height, channels, 100);
 
     CHECK_CUDA_STATUS(cudaFree(d_in));
     CHECK_CUDA_STATUS(cudaFree(d_out));
-    CHECK_CUDA_STATUS(cudaFree(d_filter_w));
-    CHECK_CUDA_STATUS(cudaFree(d_filter_h));
-    CHECK_CUDA_STATUS(cudaFree(d_filter_z));
 
     CHECK_CUDA_STATUS(cudaEventDestroy(start));
     CHECK_CUDA_STATUS(cudaEventDestroy(stop));
