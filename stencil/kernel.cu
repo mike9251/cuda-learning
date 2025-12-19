@@ -710,6 +710,24 @@ void benchmark_stencil3d_tiled_thread_coarsening_register_tiling_kernel(
 
 int main()
 {
+
+    int device_id{ 0 };
+    cudaGetDevice(&device_id);
+    cudaDeviceProp device_prop;
+    int mem_clock = 0;
+    cudaDeviceGetAttribute(&mem_clock, cudaDevAttrMemoryClockRate, device_id);
+    cudaGetDeviceProperties(&device_prop, device_id);
+    std::cout << "Device Name: " << device_prop.name << std::endl;
+    float const memory_size{ static_cast<float>(device_prop.totalGlobalMem) /
+                            (1 << 30) };
+    std::cout << "Memory Size: " << memory_size << " GB" << std::endl;
+    std::cout << "mem_clock = " << mem_clock << " device_prop.memoryBusWidth = " << device_prop.memoryBusWidth << std::endl;
+    float const peak_bandwidth{
+        static_cast<float>(2.0f * 1e3 * mem_clock *
+                           (device_prop.memoryBusWidth / 8) / 1e9) };
+    std::cout << "Peak Bandwitdh: " << peak_bandwidth << " GB/s" << std::endl;
+
+
     //test_ref_code();
 
     unsigned int width = 1000;
